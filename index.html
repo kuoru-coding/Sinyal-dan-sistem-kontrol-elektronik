@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32 Control System</title>
+<style>
+:root{--bg:#f4f6f8;--card:#fff;--tx:#1b2430;--mut:#6b7785;--bd:#d9dee4;--sp:#e8590c;--pv:#1971c2;--er:#2f9e44;--du:#9c36b5}
+@media(prefers-color-scheme:dark){:root{--bg:#12161c;--card:#1c222b;--tx:#e6e9ee;--mut:#8a95a3;--bd:#2e3743}}
+*{box-sizing:border-box}
+body{margin:0;font-family:system-ui,Arial,sans-serif;background:var(--bg);color:var(--tx)}
+.wrap{max-width:960px;margin:0 auto;padding:12px}
+h1{font-size:1.2rem;margin:4px 0 10px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:12px;margin-bottom:12px}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+input[type=number]{width:90px;padding:6px;border:1px solid var(--bd);border-radius:6px;background:var(--bg);color:var(--tx)}
+input[type=range]{flex:1;min-width:140px}
+button{padding:7px 14px;border:0;border-radius:6px;background:var(--pv);color:#fff;cursor:pointer;font-weight:600}
+button.g{background:var(--er)} button.r{background:#c92a2a} button.o{background:#868e96}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px}
+.m{background:var(--bg);border-radius:8px;padding:8px}
+.m b{display:block;font-size:1.25rem}.m span{font-size:.75rem;color:var(--mut)}
+canvas{width:100%;height:240px;display:block}
+.lg{font-size:.8rem;color:var(--mut);margin-top:4px}
+.lg i{display:inline-block;width:18px;height:3px;vertical-align:middle;margin:0 4px 0 10px}
+label{font-size:.85rem;color:var(--mut)}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>ESP32 CONTROL SYSTEM</h1>
+
+<div class="card">
+  <div class="row">
+    <label>Set Point</label>
+    <input type="number" id="sp" step="0.01" min="0" max="3.3" value="1.00"> V
+    <button onclick="setSP()">SET</button>
+    <input type="range" id="slider" min="0" max="3.3" step="0.01" value="1" oninput="sp.value=(+this.value).toFixed(2)">
+  </div>
+  <div class="row" style="margin-top:10px">
+    <button class="g" onclick="ctl(1)">START</button>
+    <button class="r" onclick="ctl(0)">STOP</button>
+    <button class="o" onclick="resetAll()">RESET</button>
+    <button class="o" onclick="location.href='/csv'">Download CSV</button>
+  </div>
+  <div class="row" style="margin-top:10px">
+    <label>Kp</label><input type="number" id="kp" step="0.1" min="0" value="1">
+    <label>Ki</label><input type="number" id="ki" step="0.1" min="0" value="0.5">
+    <label>Kd</label><input type="number" id="kd" step="0.1" min="0" value="0">
+    <button onclick="setP()">Terapkan</button>
+  </div>
+</div>
+
+<div class="card grid">
+  <div class="m"><span>Controller</span><b id="ctrl">PID</b></div>
+  <div class="m"><span>Status</span><b id="st">STOP</b></div>
+  <div class="m"><span>Set Point</span><b id="vsp">-</b></div>
+  <div class="m"><span>ADC (GPIO33)</span><b id="vpv">-</b></div>
+  <div class="m"><span>Error</span><b id="ve">-</b></div>
+  <div class="m"><span>DAC (GPIO25)</span><b id="vu">-</b></div>
+  <div class="m"><span>Overshoot</span><b id="mo">-</b></div>
+  <div class="m"><span>Settling (±2%)</span><b id="ms">-</b></div>
+  <div class="m"><span>IP ESP32</span><b id="ip" style="font-size:1rem">-</b></div>
+  <div class="m"><span>Sampling</span><b id="ts">500 ms</b></div>
+</div>
+
+<div class="card">
+  <canvas id="c1"></canvas>
+  <div class="lg"><i style="background:var(--sp)"></i>Set Point<i style="background:var(--pv)"></i>ADC GPIO33 &nbsp;(sumbu Y: Volt)</div>
+</div>
+<div class="card">
+  <canvas id="c2"></canvas>
+  <div class="lg"><i style="background:var(--er)"></i>Error<i style="background:var(--du)"></i>Output DAC &nbsp;(sumbu Y: Volt)</div>
+</div>
+</div>
+
+<script>
+const N=300;                       // jumlah titik riwayat di browser
+const H={sp:[],pv:[],e:[],u:[]};
+let lastK=-1,TS=500;
+// ---- tracking overshoot & settling sejak setpoint terakhir berubah ----
+let step={sp:null,t0:0,pvMax:-1e9,pvMin:1e9,lastOut:null};
+const $=id=>document.getElementById(id);
+const css=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+function api(p){return fetch(p).then(r=>r.json())}
+function setSP(){api('/set?sp='+$('sp').value).then(upd)}
+function setP(){api(`/params?kp=${$('kp').value}&ki=${$('ki').value}&kd=${$('kd').value}`).then(upd)}
+function ctl(r){api('/ctl?run='+r).then(upd)}
+function resetAll(){api('/reset').then(()=>{for(const k in H)H[k]=[];lastK=-1;step.sp=null;$('mo').textContent=$('ms').textContent='-'})}
+
+function track(d){
+  if(step.sp===null||d.sp!==step.sp){step={sp:d.sp,t0:d.t,pvMax:d.pv,pvMin:d.pv,lastOut:null,start:d.pv}}
+  step.pvMax=Math.max(step.pvMax,d.pv);step.pvMin=Math.min(step.pvMin,d.pv);
+  const band=Math.max(0.02*Math.abs(d.sp),0.03);      // ±2% (min 0.03 V ~ resolusi DAC/ADC)
+  if(Math.abs(d.pv-d.sp)>band)step.lastOut=d.t;
+  if(d.sp>0){
+    const up=d.sp>=step.start;
+    const os=up?(step.pvMax-d.sp)/d.sp*100:(d.sp-step.pvMin)/d.sp*100;
+    $('mo').textContent=Math.max(0,os).toFixed(1)+' %';
+  }
+  const settled=Math.abs(d.pv-d.sp)<=band;
+  $('ms').textContent=settled?((step.lastOut===null?0:step.lastOut+TS/1000-step.t0)).toFixed(1)+' s':'...';
+}
+
+function upd(d){
+  TS=d.ts;
+  $('vsp').textContent=d.sp.toFixed(2)+' V';$('vpv').textContent=d.pv.toFixed(3)+' V';
+  $('ve').textContent=d.e.toFixed(3)+' V';$('vu').textContent=d.u.toFixed(3)+' V';
+  $('st').textContent=d.run?'RUNNING':'STOP';$('ctrl').textContent=d.ctrl;$('ip').textContent=d.ip;$('ts').textContent=d.ts+' ms';
+  if(document.activeElement.type!=='number'){$('kp').value=d.kp;$('ki').value=d.ki;$('kd').value=d.kd}
+  if(d.k!==lastK){
+    lastK=d.k;
+    H.sp.push(d.sp);H.pv.push(d.pv);H.e.push(d.e);H.u.push(d.u);
+    for(const k in H)if(H[k].length>N)H[k].shift();
+    if(d.run)track(d);
+    draw($('c1'),[[H.sp,css('--sp')],[H.pv,css('--pv')]],0,3.5);
+    draw($('c2'),[[H.e,css('--er')],[H.u,css('--du')]],-1,3.5);
+  }
+}
+
+function draw(cv,series,ymin,ymax){
+  const dpr=window.devicePixelRatio||1,w=cv.clientWidth,h=cv.clientHeight;
+  cv.width=w*dpr;cv.height=h*dpr;
+  const g=cv.getContext('2d');g.scale(dpr,dpr);g.clearRect(0,0,w,h);
+  const L=38,R=8,T=8,B=20,pw=w-L-R,ph=h-T-B;
+  g.font='11px system-ui';g.fillStyle=css('--mut');g.strokeStyle=css('--bd');g.lineWidth=1;
+  for(let v=Math.ceil(ymin);v<=ymax;v+=1){
+    const y=T+ph*(1-(v-ymin)/(ymax-ymin));
+    g.beginPath();g.moveTo(L,y);g.lineTo(w-R,y);g.stroke();g.fillText(v.toFixed(1),4,y+4);
+  }
+  const span=(N*TS)/1000;
+  for(let s=0;s<=span;s+=30){
+    const x=L+pw*s/span;g.fillText(s+'s',x-8,h-4);
+  }
+  for(const [arr,col] of series){
+    g.strokeStyle=col;g.lineWidth=2;g.beginPath();
+    arr.forEach((v,i)=>{
+      const x=L+pw*i/(N-1),y=T+ph*(1-(Math.min(Math.max(v,ymin),ymax)-ymin)/(ymax-ymin));
+      i?g.lineTo(x,y):g.moveTo(x,y);
+    });
+    g.stroke();
+  }
+}
+
+function poll(){api('/data').then(upd).catch(()=>{}).finally(()=>setTimeout(poll,500))}
+poll();
+</script>
+</body>
+</html>
